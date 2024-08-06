@@ -60,6 +60,16 @@ class SparseGA():
     def get_principal_points(self):
         return torch.stack([ff[:2, -1] for ff in self.intrinsics]).to(self.working_device)
 
+    def get_intrinsics(self):
+        focals = self.get_focals()
+        pps = self.get_principal_points()
+        K = torch.zeros((len(focals), 3, 3), device=self.working_device)
+        for i in range(len(focals)):
+            K[i, 0, 0] = K[i, 1, 1] = focals[i]
+            K[i, :2, 2] = pps[i]
+            K[i, 2, 2] = 1
+        return K
+    
     def get_im_poses(self):
         return self.cam2w
 
@@ -115,7 +125,7 @@ def convert_dust3r_pairs_naming(imgs, pairs_in):
 
 
 def sparse_global_alignment(imgs, pairs_in, cache_path, model, subsample=8, desc_conf='desc_conf',
-                            device='cuda', dtype=torch.float32, shared_intrinsics=False, **kw):
+                            device='cuda', dtype=torch.float32, shared_intrinsics=False, knowed_focal=None, focal_adjustment=True, **kw):
     """ Sparse alignment with MASt3R
         imgs: list of image paths
         cache_path: path where to dump temporary files (str)
@@ -130,11 +140,11 @@ def sparse_global_alignment(imgs, pairs_in, cache_path, model, subsample=8, desc
     # forward pass
     pairs, cache_path = forward_mast3r(pairs_in, model,
                                        cache_path=cache_path, subsample=subsample,
-                                       desc_conf=desc_conf, device=device)
+                                       desc_conf=desc_conf, device='cuda')
 
     # extract canonical pointmaps
     tmp_pairs, pairwise_scores, canonical_views, canonical_paths, preds_21 = \
-        prepare_canonical_data(imgs, pairs, subsample, cache_path=cache_path, mode='avg-angle', device=device)
+        prepare_canonical_data(imgs, pairs, subsample, cache_path=cache_path, mode='avg-angle', device='cuda')
 
     # compute minimal spanning tree
     mst = compute_min_spanning_tree(pairwise_scores)
@@ -145,11 +155,11 @@ def sparse_global_alignment(imgs, pairs_in, cache_path, model, subsample=8, desc
 
     # smartly combine all usefull data
     imsizes, pps, base_focals, core_depth, anchors, corres, corres2d, preds_21 = \
-        condense_data(imgs, tmp_pairs, canonical_views, preds_21, dtype)
+        condense_data(imgs, tmp_pairs, canonical_views, preds_21, dtype, device=device)
 
     imgs, res_coarse, res_fine = sparse_scene_optimizer(
         imgs, subsample, imsizes, pps, base_focals, core_depth, anchors, corres, corres2d, preds_21, canonical_paths, mst,
-        shared_intrinsics=shared_intrinsics, cache_path=cache_path, device=device, dtype=dtype, **kw)
+        shared_intrinsics=shared_intrinsics, knowed_focal=knowed_focal, focal_adjustment=focal_adjustment, cache_path=cache_path, device=device, dtype=dtype, **kw)
 
     return SparseGA(imgs, pairs_in, res_fine or res_coarse, anchors, canonical_paths)
 
@@ -163,11 +173,13 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
                            schedule=cosine_schedule, depth_mode='add', exp_depth=False,
                            lora_depth=False,  # dict(k=96, gamma=15, min_norm=.5),
                            shared_intrinsics=False,
+                           knowed_focal=None,
+                           focal_adjustment=True,
                            init={}, device='cuda', dtype=torch.float32,
                            matching_conf_thr=5., loss_dust3r_w=0.01,
                            verbose=True, dbg=()):
 
-    # extrinsic parameters
+    # extrinsic parameters: 四元数及位移
     vec0001 = torch.tensor((0, 0, 0, 1), dtype=dtype, device=device)
     quats = [nn.Parameter(vec0001.clone()) for _ in range(len(imgs))]
     trans = [nn.Parameter(torch.zeros(3, device=device, dtype=dtype)) for _ in range(len(imgs))]
@@ -216,6 +228,13 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
         pps = [pp for _ in range(len(imgs))]
         focal_m = weighting @ base_focals
         log_focal = nn.Parameter(focal_m.view(1).log().to(dtype))
+        log_focals = [log_focal for _ in range(len(imgs))]
+    elif knowed_focal is not None:
+        confs = torch.stack([torch.load(pth)[0][2].mean() for pth in canonical_paths]).to(pps)
+        weighting = confs / confs.sum()
+        pp = nn.Parameter((weighting @ pps).to(dtype))
+        pps = [pp for _ in range(len(imgs))]
+        log_focal = nn.Parameter(torch.tensor(knowed_focal).view(1).log().to(dtype).to(device))
         log_focals = [log_focal for _ in range(len(imgs))]
     else:
         pps = [nn.Parameter(pp.to(dtype)) for pp in pps]
@@ -285,6 +304,8 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
 
     if shared_intrinsics:
         print('init focal (shared) = ', to_numpy(K[0, 0, 0]).round(2))
+    elif knowed_focal is not None:
+        print('init focal (knowed) = ', to_numpy(K[0, 0, 0]).round(2))
     else:
         print('init focals =', to_numpy(K[:, 0, 0]))
 
@@ -400,6 +421,7 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
     def optimize_loop(loss_func, lr_base, niter, pix_loss, lr_end=0):
         # create optimizer
         params = pps + log_focals + quats + trans + log_sizes + core_depth
+
         optimizer = torch.optim.Adam(params, lr=1, weight_decay=0, betas=(0.9, 0.9))
         ploss = pix_loss if 'meta' in repr(pix_loss) else (lambda a: pix_loss)
 
@@ -453,7 +475,10 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
             if init[img].get('freeze', 0) >= 1:
                 continue
             pps[i].requires_grad_(bool(opt_pp))
-            log_focals[i].requires_grad_(True)
+            if focal_adjustment:
+                log_focals[i].requires_grad_(True)
+            else:
+                log_focals[i].requires_grad_(False)
             core_depth[i].requires_grad_(opt_depth)
 
         # refinement with 2d reproj
@@ -462,6 +487,8 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
     K = make_K_cam_depth(log_focals, pps, None, None, None, None)
     if shared_intrinsics:
         print('Final focal (shared) = ', to_numpy(K[0, 0, 0]).round(2))
+    elif knowed_focal is not None:
+        print('Final focal (knowed) = ', to_numpy(K[0, 0, 0]).round(2))    
     else:
         print('Final focals =', to_numpy(K[:, 0, 0]))
 
@@ -732,8 +759,95 @@ def load_corres(path_corres, device, min_conf_thr):
 PairOfSlices = namedtuple(
     'ImgPair', 'img1, slice1, pix1, anchor_idxs1, img2, slice2, pix2, anchor_idxs2, confs, confs_sum')
 
+# def condense_data(imgs, tmp_paths, canonical_views, preds_21, dtype=torch.float32):
+#     # aggregate all data properly
+#     set_imgs = set(imgs)
 
-def condense_data(imgs, tmp_paths, canonical_views, preds_21, dtype=torch.float32):
+#     principal_points = []
+#     shapes = []
+#     focals = []
+#     core_depth = []
+#     img_anchors = {}
+#     tmp_pixels = {}
+
+#     for idx1, img1 in enumerate(imgs):
+#         # load stuff
+#         pp, shape, focal, anchors, pixels_confs, idxs, offsets = canonical_views[img1]
+
+#         principal_points.append(pp)
+#         shapes.append(shape)
+#         focals.append(focal)
+#         core_depth.append(anchors)
+
+#         img_uv1 = []
+#         img_idxs = []
+#         img_offs = []
+#         cur_n = [0]
+
+#         for img2, (pixels, match_confs) in pixels_confs.items():
+#             if img2 not in set_imgs:
+#                 continue
+#             assert len(pixels) == len(idxs[img2]) == len(offsets[img2])
+#             img_uv1.append(torch.cat((pixels, torch.ones_like(pixels[:, :1])), dim=-1))
+#             img_idxs.append(idxs[img2])
+#             img_offs.append(offsets[img2])
+#             cur_n.append(cur_n[-1] + len(pixels))
+#             # store the position of 3d points
+#             tmp_pixels[img1, img2] = pixels.to(dtype), match_confs.to(dtype), slice(*cur_n[-2:])
+#         img_anchors[idx1] = (torch.cat(img_uv1), torch.cat(img_idxs), torch.cat(img_offs))
+
+#     all_confs = []
+#     imgs_slices = []
+#     corres2d = {img: [] for img in range(len(imgs))}
+
+#     for img1, img2 in tmp_paths:
+#         try:
+#             pix1, confs1, slice1 = tmp_pixels[img1, img2]
+#             pix2, confs2, slice2 = tmp_pixels[img2, img1]
+#         except KeyError:
+#             continue
+#         img1 = imgs.index(img1)
+#         img2 = imgs.index(img2)
+#         confs = (confs1 * confs2).sqrt()
+
+#         # prepare for loss_3d
+#         all_confs.append(confs)
+#         anchor_idxs1 = canonical_views[imgs[img1]][5][imgs[img2]]
+#         anchor_idxs2 = canonical_views[imgs[img2]][5][imgs[img1]]
+#         imgs_slices.append(PairOfSlices(img1, slice1, pix1, anchor_idxs1,
+#                                         img2, slice2, pix2, anchor_idxs2,
+#                                         confs, float(confs.sum())))
+
+#         # prepare for loss_2d
+#         corres2d[img1].append((pix1, confs, img2, slice2))
+#         corres2d[img2].append((pix2, confs, img1, slice1))
+
+#     all_confs = torch.cat(all_confs)
+#     corres = (all_confs, float(all_confs.sum()), imgs_slices)
+
+#     def aggreg_matches(img1, list_matches):
+#         pix1, confs, img2, slice2 = zip(*list_matches)
+#         all_pix1 = torch.cat(pix1).to(dtype)
+#         all_confs = torch.cat(confs).to(dtype)
+#         return img1, all_pix1, all_confs, float(all_confs.sum()), [(j, sl2) for j, sl2 in zip(img2, slice2)]
+#     corres2d = [aggreg_matches(img, m) for img, m in corres2d.items()]
+
+#     imsizes = torch.tensor([(W, H) for H, W in shapes], device=pp.device)  # (W,H)
+#     principal_points = torch.stack(principal_points)
+#     focals = torch.cat(focals)
+
+#     # Subsample preds_21
+#     subsamp_preds_21 = {}
+#     for imk, imv in preds_21.items():
+#         subsamp_preds_21[imk] = {}
+#         for im2k, (pred, conf) in preds_21[imk].items():
+#             idxs = img_anchors[imgs.index(im2k)][1]
+#             subsamp_preds_21[imk][im2k] = (pred[idxs], conf[idxs])  # anchors subsample
+
+#     return imsizes, principal_points, focals, core_depth, img_anchors, corres, corres2d, subsamp_preds_21
+
+
+def condense_data(imgs, tmp_paths, canonical_views, preds_21, dtype=torch.float32, device='cpu'):
     # aggregate all data properly
     set_imgs = set(imgs)
 
@@ -748,10 +862,10 @@ def condense_data(imgs, tmp_paths, canonical_views, preds_21, dtype=torch.float3
         # load stuff
         pp, shape, focal, anchors, pixels_confs, idxs, offsets = canonical_views[img1]
 
-        principal_points.append(pp)
+        principal_points.append(pp.to(device))
         shapes.append(shape)
-        focals.append(focal)
-        core_depth.append(anchors)
+        focals.append(focal.to(device))
+        core_depth.append(anchors.to(device))
 
         img_uv1 = []
         img_idxs = []
@@ -762,9 +876,9 @@ def condense_data(imgs, tmp_paths, canonical_views, preds_21, dtype=torch.float3
             if img2 not in set_imgs:
                 continue
             assert len(pixels) == len(idxs[img2]) == len(offsets[img2])
-            img_uv1.append(torch.cat((pixels, torch.ones_like(pixels[:, :1])), dim=-1))
-            img_idxs.append(idxs[img2])
-            img_offs.append(offsets[img2])
+            img_uv1.append(torch.cat((pixels, torch.ones_like(pixels[:, :1])), dim=-1).to(device))
+            img_idxs.append(idxs[img2].to(device))
+            img_offs.append(offsets[img2].to(device))
             cur_n.append(cur_n[-1] + len(pixels))
             # store the position of 3d points
             tmp_pixels[img1, img2] = pixels.to(dtype), match_confs.to(dtype), slice(*cur_n[-2:])
@@ -782,19 +896,19 @@ def condense_data(imgs, tmp_paths, canonical_views, preds_21, dtype=torch.float3
             continue
         img1 = imgs.index(img1)
         img2 = imgs.index(img2)
-        confs = (confs1 * confs2).sqrt()
+        confs = (confs1 * confs2).sqrt().to(device)
 
         # prepare for loss_3d
         all_confs.append(confs)
-        anchor_idxs1 = canonical_views[imgs[img1]][5][imgs[img2]]
-        anchor_idxs2 = canonical_views[imgs[img2]][5][imgs[img1]]
-        imgs_slices.append(PairOfSlices(img1, slice1, pix1, anchor_idxs1,
-                                        img2, slice2, pix2, anchor_idxs2,
+        anchor_idxs1 = canonical_views[imgs[img1]][5][imgs[img2]].to(device)
+        anchor_idxs2 = canonical_views[imgs[img2]][5][imgs[img1]].to(device)
+        imgs_slices.append(PairOfSlices(img1, slice1, pix1.to(device), anchor_idxs1.to(device),
+                                        img2, slice2, pix2.to(device), anchor_idxs2.to(device),
                                         confs, float(confs.sum())))
 
         # prepare for loss_2d
-        corres2d[img1].append((pix1, confs, img2, slice2))
-        corres2d[img2].append((pix2, confs, img1, slice1))
+        corres2d[img1].append((pix1.to(device), confs, img2, slice2))
+        corres2d[img2].append((pix2.to(device), confs, img1, slice1))
 
     all_confs = torch.cat(all_confs)
     corres = (all_confs, float(all_confs.sum()), imgs_slices)
@@ -806,7 +920,7 @@ def condense_data(imgs, tmp_paths, canonical_views, preds_21, dtype=torch.float3
         return img1, all_pix1, all_confs, float(all_confs.sum()), [(j, sl2) for j, sl2 in zip(img2, slice2)]
     corres2d = [aggreg_matches(img, m) for img, m in corres2d.items()]
 
-    imsizes = torch.tensor([(W, H) for H, W in shapes], device=pp.device)  # (W,H)
+    imsizes = torch.tensor([(W, H) for H, W in shapes], device=device)  # (W,H)
     principal_points = torch.stack(principal_points)
     focals = torch.cat(focals)
 
@@ -816,7 +930,7 @@ def condense_data(imgs, tmp_paths, canonical_views, preds_21, dtype=torch.float3
         subsamp_preds_21[imk] = {}
         for im2k, (pred, conf) in preds_21[imk].items():
             idxs = img_anchors[imgs.index(im2k)][1]
-            subsamp_preds_21[imk][im2k] = (pred[idxs], conf[idxs])  # anchors subsample
+            subsamp_preds_21[imk][im2k] = (pred[idxs].to(device), conf[idxs].to(device))  # anchors subsample
 
     return imsizes, principal_points, focals, core_depth, img_anchors, corres, corres2d, subsamp_preds_21
 
